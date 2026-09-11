@@ -4,6 +4,10 @@
   "main": "src/worker.ts",
   "compatibility_date": "2026-08-31",
   "compatibility_flags": ["global_fetch_strictly_public"],
+  "keep_vars": true,
+  "secrets": {
+    "required": ["MCP_PATH"]
+  },
   "observability": {
     "enabled": true
   }
