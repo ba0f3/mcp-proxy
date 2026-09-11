@@ -41,6 +41,15 @@ const FORBIDDEN_REQUEST_HEADERS = new Set([
   "cf-visitor",
 ]);
 
+const CROSS_ORIGIN_SENSITIVE_HEADERS = [
+  "authorization",
+  "cookie",
+  "x-api-key",
+  "api-key",
+  "x-auth-token",
+  "x-access-token",
+];
+
 const BLOCKED_HOST_SUFFIXES = [
   ".localhost",
   ".local",
@@ -136,6 +145,12 @@ function sanitizeHeaders(input?: Record<string, string>): Headers {
   return headers;
 }
 
+function stripCrossOriginSecrets(headers: Headers): Headers {
+  const safe = new Headers(headers);
+  for (const name of CROSS_ORIGIN_SENSITIVE_HEADERS) safe.delete(name);
+  return safe;
+}
+
 function headersToObject(headers: Headers): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [name, value] of headers.entries()) result[name] = value;
@@ -221,16 +236,19 @@ function redirectMethod(
   return { method, body, headers };
 }
 
-async function performCurl(args: {
-  url: string;
-  method?: string;
-  headers?: Record<string, string>;
-  body?: string;
-  timeout_ms?: number;
-  max_bytes?: number;
-  follow_redirects?: boolean;
-  max_redirects?: number;
-}, selfHost: string): Promise<CurlResult> {
+async function performCurl(
+  args: {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    timeout_ms?: number;
+    max_bytes?: number;
+    follow_redirects?: boolean;
+    max_redirects?: number;
+  },
+  selfHost: string,
+): Promise<CurlResult> {
   let currentUrl = validateTargetUrl(args.url, selfHost);
   let method = (args.method ?? "GET").toUpperCase();
   let body = args.body;
@@ -269,11 +287,18 @@ async function performCurl(args: {
 
       if (followRedirects && isRedirect && location) {
         if (redirects >= maxRedirects) {
+          await response.body?.cancel();
           throw new Error(`Too many redirects (>${maxRedirects})`);
         }
 
         const nextUrl = validateTargetUrl(new URL(location, currentUrl).toString(), selfHost);
-        const next = redirectMethod(response.status, method, body, headers);
+        let nextHeaders = headers;
+        if (nextUrl.origin !== currentUrl.origin) {
+          nextHeaders = stripCrossOriginSecrets(nextHeaders);
+        }
+
+        const next = redirectMethod(response.status, method, body, nextHeaders);
+        await response.body?.cancel();
         currentUrl = nextUrl;
         method = next.method;
         body = next.body;
@@ -312,7 +337,7 @@ function createServer(selfHost: string): McpServer {
     { name: "safe-curl", version: VERSION },
     {
       instructions:
-        "Use curl to access public HTTP/HTTPS resources. IP literals, local/internal names, this MCP host, unsafe hop-by-hop headers, oversized bodies/responses, and excessive redirects are blocked.",
+        "Use curl to access public HTTP/HTTPS resources. IP literals, local/internal names, this MCP host, unsafe hop-by-hop headers, oversized bodies/responses, and excessive redirects are blocked. Sensitive credentials are stripped on cross-origin redirects.",
     },
   );
 
@@ -401,8 +426,8 @@ export default {
 
     const requestUrl = new URL(request.url);
 
-    // Path itself is the bearer secret. Return 404 rather than 401 so MCP
-    // clients do not attempt OAuth discovery when the URL is wrong.
+    // The path itself is the bearer secret. Return 404 rather than 401 so MCP
+    // clients do not attempt OAuth discovery when the configured URL is wrong.
     if (requestUrl.pathname !== expectedPath) {
       return new Response("Not found", { status: 404 });
     }
