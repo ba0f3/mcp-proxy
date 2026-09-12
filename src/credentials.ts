@@ -11,6 +11,7 @@ export type CredentialRule = {
   host_pattern: string;
   path_prefix: string;
   headers: Record<string, string>;
+  secret_headers: string[];
   mode: CredentialMergeMode;
   priority: number;
   https_only: boolean;
@@ -19,11 +20,12 @@ export type CredentialRule = {
   updated_at: string;
 };
 
-export type CredentialRuleInput = Partial<Omit<CredentialRule, "id" | "created_at" | "updated_at">> & {
+export type CredentialRuleInput = {
   name?: unknown;
   host_pattern?: unknown;
   path_prefix?: unknown;
   headers?: unknown;
+  secret_headers?: unknown;
   mode?: unknown;
   priority?: unknown;
   https_only?: unknown;
@@ -42,6 +44,24 @@ const MAX_RULES = 200;
 const MAX_HEADERS_PER_RULE = 64;
 const MAX_HEADER_VALUE_LENGTH = 16 * 1024;
 
+const LEGACY_SECRET_HEADER_NAMES = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+  "api-key",
+  "x-auth-token",
+  "x-access-token",
+  "x-secret-key",
+  "x-signature",
+  "private-token",
+  "x-gitlab-token",
+  "x-goog-api-key",
+  "x-amz-security-token",
+  "cf-access-client-secret",
+]);
+
 function normalizeHostPattern(input: string): string {
   let value = input.trim().toLowerCase().replace(/\.$/, "");
   if (!value) throw new Error("Domain is required");
@@ -55,8 +75,6 @@ function normalizeHostPattern(input: string): string {
     throw new Error("Invalid domain pattern");
   }
 
-  // DNS hostname / punycode labels. Deliberately keep the rule language small:
-  // exact hostnames and a single leading wildcard only.
   if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(hostname)) {
     throw new Error("Invalid domain pattern");
   }
@@ -100,14 +118,42 @@ function normalizeHeaders(input: unknown): Record<string, string> {
       throw new Error(`Header ${name} is too large`);
     }
 
-    // Let the platform Headers implementation validate syntax. We deliberately
-    // do not maintain an application-level forbidden header list.
     const probe = new Headers();
     probe.set(name, rawValue);
     result[name] = rawValue;
   }
 
   return result;
+}
+
+function inferLegacySecretHeaders(headers: Record<string, string>): string[] {
+  return Object.keys(headers)
+    .map((name) => name.toLowerCase())
+    .filter((name) => LEGACY_SECRET_HEADER_NAMES.has(name));
+}
+
+function normalizeSecretHeaders(
+  input: unknown,
+  headers: Record<string, string>,
+  fallback?: string[],
+): string[] {
+  const headerNames = new Set(Object.keys(headers).map((name) => name.toLowerCase()));
+  const source = input === undefined ? fallback ?? inferLegacySecretHeaders(headers) : input;
+  if (!Array.isArray(source)) throw new Error("secret_headers must be an array");
+
+  const result = new Set<string>();
+  for (const rawName of source) {
+    if (typeof rawName !== "string") throw new Error("secret_headers entries must be strings");
+    const name = rawName.trim().toLowerCase();
+    if (!name) continue;
+    if (!headerNames.has(name)) throw new Error(`Secret header ${rawName} does not exist in headers`);
+    result.add(name);
+  }
+  return [...result].sort();
+}
+
+export function isSecretHeader(rule: CredentialRule, name: string): boolean {
+  return rule.secret_headers.includes(name.toLowerCase());
 }
 
 export function validateCredentialRuleInput(
@@ -126,6 +172,11 @@ export function validateCredentialRuleInput(
     String(input.path_prefix ?? existing?.path_prefix ?? "/"),
   );
   const headers = normalizeHeaders(input.headers ?? existing?.headers ?? {});
+  const secretHeaders = normalizeSecretHeaders(
+    input.secret_headers,
+    headers,
+    existing?.secret_headers,
+  );
 
   const rawMode = input.mode ?? existing?.mode ?? "override";
   if (rawMode !== "override" && rawMode !== "if_missing") {
@@ -149,6 +200,7 @@ export function validateCredentialRuleInput(
     host_pattern: hostPattern,
     path_prefix: pathPrefix,
     headers,
+    secret_headers: secretHeaders,
     mode: rawMode,
     priority,
     https_only: httpsOnly,
@@ -158,21 +210,49 @@ export function validateCredentialRuleInput(
   };
 }
 
-function isCredentialRule(value: unknown): value is CredentialRule {
-  if (!value || typeof value !== "object") return false;
+function normalizeStoredRule(value: unknown): CredentialRule | null {
+  if (!value || typeof value !== "object") return null;
   const rule = value as Partial<CredentialRule>;
-  return Boolean(
-    typeof rule.id === "string" &&
-      typeof rule.name === "string" &&
-      typeof rule.host_pattern === "string" &&
-      typeof rule.path_prefix === "string" &&
-      rule.headers &&
-      typeof rule.headers === "object" &&
-      (rule.mode === "override" || rule.mode === "if_missing") &&
-      typeof rule.priority === "number" &&
-      typeof rule.https_only === "boolean" &&
-      typeof rule.enabled === "boolean",
-  );
+  if (
+    typeof rule.id !== "string" ||
+    typeof rule.name !== "string" ||
+    typeof rule.host_pattern !== "string" ||
+    typeof rule.path_prefix !== "string" ||
+    !rule.headers ||
+    typeof rule.headers !== "object" ||
+    Array.isArray(rule.headers) ||
+    (rule.mode !== "override" && rule.mode !== "if_missing") ||
+    typeof rule.priority !== "number" ||
+    typeof rule.https_only !== "boolean" ||
+    typeof rule.enabled !== "boolean"
+  ) {
+    return null;
+  }
+
+  try {
+    const headers = normalizeHeaders(rule.headers);
+    const secretHeaders = normalizeSecretHeaders(
+      rule.secret_headers,
+      headers,
+      inferLegacySecretHeaders(headers),
+    );
+    return {
+      id: rule.id,
+      name: rule.name,
+      host_pattern: rule.host_pattern,
+      path_prefix: rule.path_prefix,
+      headers,
+      secret_headers: secretHeaders,
+      mode: rule.mode,
+      priority: rule.priority,
+      https_only: rule.https_only,
+      enabled: rule.enabled,
+      created_at: typeof rule.created_at === "string" ? rule.created_at : new Date(0).toISOString(),
+      updated_at: typeof rule.updated_at === "string" ? rule.updated_at : new Date(0).toISOString(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function loadCredentialRules(kv?: CredentialKV): Promise<CredentialRule[]> {
@@ -183,7 +263,10 @@ export async function loadCredentialRules(kv?: CredentialKV): Promise<Credential
   try {
     const decoded = JSON.parse(raw);
     if (!Array.isArray(decoded)) return [];
-    return decoded.filter(isCredentialRule).slice(0, MAX_RULES);
+    return decoded
+      .map(normalizeStoredRule)
+      .filter((rule): rule is CredentialRule => Boolean(rule))
+      .slice(0, MAX_RULES);
   } catch {
     return [];
   }
@@ -221,8 +304,6 @@ function sortedMatchingRules(rules: CredentialRule[], url: URL): CredentialRule[
     .sort((a, b) => {
       if (a.priority !== b.priority) return a.priority - b.priority;
 
-      // Less specific rules apply first. More specific rules therefore win when
-      // they use override mode at the same priority.
       const aWildcard = a.host_pattern.startsWith("*.") ? 0 : 1;
       const bWildcard = b.host_pattern.startsWith("*.") ? 0 : 1;
       if (aWildcard !== bWildcard) return aWildcard - bWildcard;
