@@ -6,7 +6,7 @@
   "compatibility_flags": ["global_fetch_strictly_public"],
   "keep_vars": true,
   "secrets": {
-    "required": ["MCP_PATH"]
+    "required": ["MCP_PATH", "NC_API_KEY"]
   },
   "observability": {
     "enabled": true
