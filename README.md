@@ -14,6 +14,8 @@ https://mcp-proxy.<account>.workers.dev/<random-secret>
 
 `<random-secret>` replaces the usual `/mcp` path. Requests to any other path return `404` rather than `401`, so MCP clients do not start OAuth discovery.
 
+The human admin UI is separate and uses a normal password login at `/admin`.
+
 ## Tool: `curl`
 
 The tool is intentionally read/write and generic.
@@ -86,29 +88,24 @@ Rules are evaluated **per outbound hop**. Injected credentials are never copied 
 
 ### Admin UI
 
-Set one additional random secret to enable the credential UI:
+Set an admin password as a Worker runtime secret:
 
 ```bash
-ADMIN_PATH="$(openssl rand -hex 32)"
-printf '%s' "$ADMIN_PATH" | npx wrangler secret put ADMIN_PATH
+printf '%s' 'use-a-long-random-password-here' | npx wrangler secret put ADMIN_PASSWORD
 npm run deploy
 ```
 
-Open the bootstrap URL once:
-
-```text
-https://mcp-proxy.example.workers.dev/admin/<ADMIN_PATH>
-```
-
-The Worker stores the secret in an `HttpOnly; Secure; SameSite=Strict` admin cookie and redirects to:
+Then open:
 
 ```text
 https://mcp-proxy.example.workers.dev/admin
 ```
 
+After a successful login the Worker sets an `HttpOnly; Secure; SameSite=Strict` session cookie scoped to `/admin`. The password itself is never placed in the cookie or URL. Changing `ADMIN_PASSWORD` invalidates existing admin sessions.
+
 The UI supports create/edit/delete, header rows, wildcard domains, path prefixes, priority/mode, enable/disable, and a URL matcher test.
 
-`ADMIN_PATH` is intentionally **not** declared as a required deploy secret. If it is absent, the normal MCP proxy keeps working and `/admin` returns `503`.
+`ADMIN_PASSWORD` is required at deploy time. `ADMIN_PATH` is no longer used for the admin UI. The MCP endpoint still uses `MCP_PATH` because MCP clients may otherwise start OAuth discovery.
 
 The credential rules are stored as application data in Workers KV. The MCP tool never returns stored header values and logs never include credential values.
 
@@ -143,7 +140,7 @@ Structured JSON logs are emitted for:
 
 Logs include `request_id`, Cloudflare Ray ID when available, method, target host/path, status, timings, byte counts, redirect count, query parameter names, header names, and matched credential rule IDs/names.
 
-Logs **do not include** request/response bodies, header values, credential values, MCP secret paths, admin secret paths, or query-string values.
+Logs **do not include** request/response bodies, header values, credential values, MCP secret paths, admin passwords, or query-string values.
 
 Tail live logs:
 
@@ -161,14 +158,13 @@ npm install
 MCP_PATH="$(openssl rand -hex 32)"
 printf '%s' "$MCP_PATH" | npx wrangler secret put MCP_PATH
 
-# Optional but required for the credential admin UI.
-ADMIN_PATH="$(openssl rand -hex 32)"
-printf '%s' "$ADMIN_PATH" | npx wrangler secret put ADMIN_PATH
+ADMIN_PASSWORD="$(openssl rand -base64 32)"
+printf '%s' "$ADMIN_PASSWORD" | npx wrangler secret put ADMIN_PASSWORD
 
 npm run deploy
 
 echo "MCP path: /$MCP_PATH"
-echo "Admin bootstrap: /admin/$ADMIN_PATH"
+echo "Admin UI: /admin"
 ```
 
 `wrangler.jsonc` declares a `CREDENTIALS` KV binding without an account-specific namespace ID. Modern Wrangler automatically provisions and links the KV namespace on deploy; when deploying through a dashboard/Git integration, the generated resource ID remains visible in the Cloudflare dashboard rather than being written back to the repository.
@@ -193,5 +189,5 @@ For local development, create `.dev.vars`:
 
 ```text
 MCP_PATH=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-ADMIN_PATH=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+ADMIN_PASSWORD=change-me-to-a-strong-password
 ```
