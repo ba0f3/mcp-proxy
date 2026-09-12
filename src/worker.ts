@@ -22,6 +22,19 @@ export default {
     // MCP Streamable HTTP requires Origin validation. Non-browser/server-side
     // clients normally omit Origin; if present, only same-origin is accepted.
     if (!validOrigin(request)) {
+      const requestUrl = new URL(request.url);
+      console.warn(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          service: "mcp-proxy",
+          level: "warn",
+          event: "mcp.origin_rejected",
+          mcp_ray: request.headers.get("cf-ray") ?? undefined,
+          method: request.method,
+          host: requestUrl.host,
+          origin: request.headers.get("origin"),
+        }),
+      );
       return new Response("Forbidden", { status: 403 });
     }
 
