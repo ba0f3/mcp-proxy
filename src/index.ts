@@ -1,11 +1,19 @@
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
+import { handleAdminRequest } from "./admin";
+import {
+  applyCredentialRules,
+  loadCredentialRules,
+  type CredentialKV,
+} from "./credentials";
 
 interface Env {
   MCP_PATH: string;
+  ADMIN_PATH?: string;
+  CREDENTIALS?: CredentialKV;
 }
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_REDIRECTS = 10;
@@ -58,6 +66,7 @@ type CurlResult = {
   response_bytes: number;
   elapsed_ms: number;
   redirects: number;
+  credential_rules_applied: number;
   truncated: boolean;
 };
 
@@ -153,9 +162,8 @@ function validateTargetUrl(rawUrl: string, selfHost: string): URL {
 }
 
 function buildHeaders(input?: Record<string, string>): Headers {
-  // Transparent pass-through: do not classify, remove, rewrite, or override
-  // caller headers. The Workers Fetch runtime remains the final authority on
-  // whether a particular HTTP header is accepted on an outbound request.
+  // Transparent pass-through: caller headers remain untouched. Managed
+  // credential rules are layered onto a per-hop copy immediately before fetch.
   return new Headers(input ?? {});
 }
 
@@ -200,9 +208,6 @@ function base64ToArrayBuffer(input: string): ArrayBuffer {
 }
 
 function prepareBody(args: CurlArgs, headers: Headers): PreparedBody {
-  // `body` is the exact/pass-through path. The other fields are convenience
-  // encodings for agents. If more than one is supplied, use deterministic
-  // precedence instead of rejecting the request: body > body_base64 > json > form.
   if (args.body !== undefined) {
     return {
       body: args.body,
@@ -296,9 +301,6 @@ function redirectRequest(
   body: string | ArrayBuffer | undefined,
   headers: Headers,
 ): { method: string; body: string | ArrayBuffer | undefined; headers: Headers } {
-  // Preserve curl/browser redirect semantics while keeping the caller headers
-  // otherwise untouched. Redirects are manual only so every target can pass
-  // the network/SSRF validation before the next outbound request.
   const upperMethod = method.toUpperCase();
   if (status === 303 || ((status === 301 || status === 302) && upperMethod === "POST")) {
     return { method: "GET", body: undefined, headers };
@@ -309,20 +311,22 @@ function redirectRequest(
 async function performCurl(
   args: CurlArgs,
   selfHost: string,
+  env: Env,
   mcpRay?: string,
 ): Promise<CurlResult> {
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   let currentUrl = validateTargetUrl(args.url, selfHost);
   let method = args.method ?? "GET";
-  let headers = buildHeaders(args.headers);
-  const prepared = prepareBody(args, headers);
+  let callerHeaders = buildHeaders(args.headers);
+  const prepared = prepareBody(args, callerHeaders);
   let body = prepared.body;
 
   const timeoutMs = args.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = args.max_bytes ?? DEFAULT_MAX_BYTES;
   const followRedirects = args.follow_redirects ?? true;
   const maxRedirects = args.max_redirects ?? DEFAULT_MAX_REDIRECTS;
+  const credentialRules = await loadCredentialRules(env.CREDENTIALS);
 
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -331,6 +335,7 @@ async function performCurl(
   }
 
   let redirectCount = 0;
+  const usedRuleIds = new Set<string>();
 
   logEvent("info", "curl.start", {
     request_id: requestId,
@@ -343,14 +348,32 @@ async function performCurl(
     timeout_ms: timeoutMs,
     max_response_bytes: maxBytes,
     follow_redirects: followRedirects,
-    ...headerSummary(headers),
+    credential_rules_loaded: credentialRules.length,
+    ...headerSummary(callerHeaders),
   });
 
   try {
     for (;;) {
+      // Managed headers are computed independently for every outbound hop.
+      // They never become part of callerHeaders, so a credential for one domain
+      // cannot accidentally follow a redirect to another domain.
+      const applied = applyCredentialRules(callerHeaders, currentUrl, credentialRules);
+      for (const id of applied.matched_rule_ids) usedRuleIds.add(id);
+
+      if (applied.matched_rule_ids.length > 0) {
+        logEvent("info", "curl.credentials_applied", {
+          request_id: requestId,
+          mcp_ray: mcpRay,
+          target: safeTarget(currentUrl),
+          rule_ids: applied.matched_rule_ids,
+          rule_names: applied.matched_rule_names,
+          injected_header_names: applied.injected_header_names,
+        });
+      }
+
       const response = await fetch(currentUrl.toString(), {
         method,
-        headers,
+        headers: applied.headers,
         body,
         redirect: "manual",
         signal: controller.signal,
@@ -377,16 +400,18 @@ async function performCurl(
           from: safeTarget(currentUrl),
           to: safeTarget(nextUrl),
           cross_origin: crossOrigin,
-          headers_forwarded_unchanged: true,
-          ...headerSummary(headers),
+          caller_headers_forwarded_unchanged: true,
+          credential_headers_recomputed_per_hop: true,
+          current_credential_rule_ids: applied.matched_rule_ids,
+          ...headerSummary(callerHeaders),
         });
 
-        const next = redirectRequest(response.status, method, body, headers);
+        const next = redirectRequest(response.status, method, body, callerHeaders);
         await response.body?.cancel();
         currentUrl = nextUrl;
         method = next.method;
         body = next.body;
-        headers = next.headers;
+        callerHeaders = next.headers;
         continue;
       }
 
@@ -411,6 +436,7 @@ async function performCurl(
         response_bytes: bytes.byteLength,
         elapsed_ms: elapsedMs,
         redirects: redirectCount,
+        credential_rules_applied: usedRuleIds.size,
         truncated,
       };
 
@@ -425,6 +451,7 @@ async function performCurl(
         response_bytes: bytes.byteLength,
         elapsed_ms: elapsedMs,
         redirects: redirectCount,
+        credential_rules_applied: usedRuleIds.size,
         truncated,
       });
 
@@ -440,6 +467,7 @@ async function performCurl(
         method,
         target: safeTarget(currentUrl),
         elapsed_ms: elapsedMs,
+        credential_rules_applied: usedRuleIds.size,
         error_name: "TimeoutError",
         error_message: `Request timed out after ${timeoutMs} ms`,
       });
@@ -453,6 +481,7 @@ async function performCurl(
       method,
       target: safeTarget(currentUrl),
       elapsed_ms: elapsedMs,
+      credential_rules_applied: usedRuleIds.size,
       error_name: safeError.name,
       error_message: safeError.message,
     });
@@ -462,12 +491,12 @@ async function performCurl(
   }
 }
 
-function createServer(selfHost: string, mcpRay?: string): McpServer {
+function createServer(selfHost: string, env: Env, mcpRay?: string): McpServer {
   const server = new McpServer(
     { name: "internet-curl", version: VERSION },
     {
       instructions:
-        "Transparent HTTP/HTTPS curl for the public Internet. Forward caller method, headers, credentials, cookies, and body without application-level filtering or auth/write policy. Only the public-network/SSRF boundary and Cloudflare runtime limitations apply.",
+        "Transparent HTTP/HTTPS curl for the public Internet. Forward caller method, headers, credentials, cookies, and body without application-level filtering or auth/write policy. Server-managed credential rules may add or override request headers based on destination domain/path. Only the public-network/SSRF boundary and Cloudflare runtime limitations apply.",
     },
   );
 
@@ -476,7 +505,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
     {
       title: "Internet Curl",
       description:
-        "Transparent HTTP/HTTPS request tool. Caller-supplied method, headers, Authorization, X-Api-Key, Cookie, custom credentials, query string, and body are forwarded as supplied. POST/PUT/PATCH/DELETE and arbitrary HTTP methods are not blocked by this MCP server. The server only validates the destination against the public-network/SSRF boundary and manually validates redirect targets.",
+        "Transparent HTTP/HTTPS request tool. Caller-supplied method, headers, Authorization, X-Api-Key, Cookie, custom credentials, query string, and body are forwarded as supplied. In addition, server-managed credential rules can inject headers for matching domains/path prefixes, allowing authenticated API calls without putting secrets in the tool arguments. POST/PUT/PATCH/DELETE and arbitrary HTTP methods are not blocked by this MCP server. The server only validates the destination against the public-network/SSRF boundary and manually validates redirect targets.",
       inputSchema: z.object({
         url: z.string().url().describe("Public http:// or https:// URL, including any query string"),
         method: z
@@ -486,7 +515,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
         headers: z
           .record(z.string(), z.string())
           .optional()
-          .describe("HTTP request headers forwarded without MCP-side filtering, rewriting, or credential stripping"),
+          .describe("HTTP request headers forwarded without MCP-side filtering. Matching server credential rules may add/override headers per domain"),
         body: z
           .string()
           .optional()
@@ -538,6 +567,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
         response_bytes: z.number().int(),
         elapsed_ms: z.number().int(),
         redirects: z.number().int(),
+        credential_rules_applied: z.number().int(),
         truncated: z.boolean(),
       }),
       annotations: {
@@ -547,7 +577,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
     },
     async (args) => {
       try {
-        const result = await performCurl(args, selfHost, mcpRay);
+        const result = await performCurl(args, selfHost, env, mcpRay);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
           structuredContent: result,
@@ -567,6 +597,9 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const adminResponse = await handleAdminRequest(request, env);
+    if (adminResponse) return adminResponse;
+
     const mcpRay = request.headers.get("cf-ray") ?? undefined;
     let expectedPath: string;
 
@@ -592,7 +625,7 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    const handler = createMcpHandler(() => createServer(requestUrl.hostname, mcpRay));
+    const handler = createMcpHandler(() => createServer(requestUrl.hostname, env, mcpRay));
     return handler.fetch(request);
   },
 };
