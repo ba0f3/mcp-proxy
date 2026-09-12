@@ -3,15 +3,22 @@ import * as z from "zod/v4";
 
 interface Env {
   MCP_PATH: string;
+  NC_API_KEY: string;
 }
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const HARD_MAX_BYTES = 4 * 1024 * 1024;
 const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_REDIRECTS = 5;
+
+// Server-side upstream credential injection. Keep this deliberately narrow:
+// exact HTTPS host + NocoBase MCP path only. The credential never appears in
+// MCP tool arguments, logs, responses, or redirects to other hosts.
+const NOCOBASE_AUTH_HOST = "portal-dev1az5avn.vozer.org";
+const NOCOBASE_MCP_PATH_PREFIX = "/api/mcp";
 
 const ALLOWED_METHODS = new Set([
   "GET",
@@ -92,6 +99,7 @@ type CurlResult = {
   response_bytes: number;
   elapsed_ms: number;
   redirects: number;
+  server_auth_injected: boolean;
   truncated: boolean;
 };
 
@@ -218,6 +226,38 @@ function authSummary(headers: Headers): Record<string, boolean> {
     x_api_key: headers.has("x-api-key"),
     cookie: headers.has("cookie"),
   };
+}
+
+function isNocoBaseMcpTarget(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  const pathMatches =
+    url.pathname === NOCOBASE_MCP_PATH_PREFIX ||
+    url.pathname.startsWith(`${NOCOBASE_MCP_PATH_PREFIX}/`);
+
+  return url.protocol === "https:" && hostname === NOCOBASE_AUTH_HOST && pathMatches;
+}
+
+function buildRequestHeaders(
+  callerHeaders: Headers,
+  url: URL,
+  env: Env,
+): { headers: Headers; serverAuthInjected: boolean } {
+  const headers = new Headers(callerHeaders);
+  if (!isNocoBaseMcpTarget(url)) {
+    return { headers, serverAuthInjected: false };
+  }
+
+  const rawToken = (env.NC_API_KEY ?? "").trim();
+  if (!rawToken) {
+    throw new Error("NC_API_KEY is not configured for NocoBase server authentication");
+  }
+
+  // Accept either a raw NocoBase token or a pre-prefixed Bearer value in the
+  // Worker secret, but never expose it back to the MCP client.
+  const authorization = /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`;
+  headers.set("authorization", authorization);
+
+  return { headers, serverAuthInjected: true };
 }
 
 function headersToObject(headers: Headers): Record<string, string> {
@@ -385,14 +425,15 @@ function redirectRequest(
 async function performCurl(
   args: CurlArgs,
   selfHost: string,
+  env: Env,
   mcpRay?: string,
 ): Promise<CurlResult> {
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   let currentUrl = validateTargetUrl(args.url, selfHost);
   let method = (args.method ?? "GET").toUpperCase();
-  let headers = sanitizeHeaders(args.headers);
-  const prepared = prepareBody(args, headers);
+  let callerHeaders = sanitizeHeaders(args.headers);
+  const prepared = prepareBody(args, callerHeaders);
   let body = prepared.body;
 
   if (!ALLOWED_METHODS.has(method)) {
@@ -409,6 +450,7 @@ async function performCurl(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("request timeout"), timeoutMs);
   let redirectCount = 0;
+  let serverAuthUsed = false;
 
   logEvent("info", "curl.start", {
     request_id: requestId,
@@ -421,14 +463,30 @@ async function performCurl(
     timeout_ms: timeoutMs,
     max_response_bytes: maxBytes,
     follow_redirects: followRedirects,
-    ...authSummary(headers),
+    server_auth_target: isNocoBaseMcpTarget(currentUrl),
+    ...authSummary(callerHeaders),
   });
 
   try {
     for (;;) {
+      // Derive effective headers for every hop. Server-side credentials are
+      // never stored in callerHeaders, so they cannot accidentally survive a
+      // redirect to another hostname.
+      const requestHeaders = buildRequestHeaders(callerHeaders, currentUrl, env);
+      if (requestHeaders.serverAuthInjected) {
+        serverAuthUsed = true;
+        logEvent("info", "curl.auth_injected", {
+          request_id: requestId,
+          mcp_ray: mcpRay,
+          target: safeTarget(currentUrl),
+          auth_source: "NC_API_KEY",
+          auth_scheme: "Bearer",
+        });
+      }
+
       const response = await fetch(currentUrl.toString(), {
         method,
-        headers,
+        headers: requestHeaders.headers,
         body,
         redirect: "manual",
         signal: controller.signal,
@@ -445,12 +503,12 @@ async function performCurl(
 
         const nextUrl = validateTargetUrl(new URL(location, currentUrl).toString(), selfHost);
         const crossOrigin = nextUrl.origin !== currentUrl.origin;
+        const nextServerAuth = isNocoBaseMcpTarget(nextUrl);
         redirectCount += 1;
 
-        // This gateway intentionally behaves like an explicit, trusted curl
-        // agent: caller-supplied Authorization/X-Api-Key/Cookie headers survive
-        // manual redirects, including cross-origin redirects. Log the fact, but
-        // never log credential values.
+        // Caller-supplied credentials keep curl-like redirect semantics. The
+        // server-side NocoBase token is different: it is derived per-hop and is
+        // only ever attached to the exact allowlisted HTTPS MCP endpoint.
         logEvent(crossOrigin ? "warn" : "info", "curl.redirect", {
           request_id: requestId,
           mcp_ray: mcpRay,
@@ -459,15 +517,19 @@ async function performCurl(
           from: safeTarget(currentUrl),
           to: safeTarget(nextUrl),
           cross_origin: crossOrigin,
-          credentials_forwarded: crossOrigin && Object.values(authSummary(headers)).some(Boolean),
+          caller_credentials_forwarded:
+            crossOrigin && Object.values(authSummary(callerHeaders)).some(Boolean),
+          server_auth_current: requestHeaders.serverAuthInjected,
+          server_auth_next: nextServerAuth,
+          server_auth_leaked_cross_origin: false,
         });
 
-        const next = redirectRequest(response.status, method, body, headers);
+        const next = redirectRequest(response.status, method, body, callerHeaders);
         await response.body?.cancel();
         currentUrl = nextUrl;
         method = next.method;
         body = next.body;
-        headers = next.headers;
+        callerHeaders = next.headers;
         continue;
       }
 
@@ -488,6 +550,7 @@ async function performCurl(
         response_bytes: bytes.byteLength,
         elapsed_ms: elapsedMs,
         redirects: redirectCount,
+        server_auth_injected: serverAuthUsed,
         truncated,
       };
 
@@ -502,6 +565,7 @@ async function performCurl(
         response_bytes: bytes.byteLength,
         elapsed_ms: elapsedMs,
         redirects: redirectCount,
+        server_auth_injected: serverAuthUsed,
         truncated,
       });
 
@@ -516,6 +580,7 @@ async function performCurl(
         method,
         target: safeTarget(currentUrl),
         elapsed_ms: elapsedMs,
+        server_auth_injected: serverAuthUsed,
         error_name: "TimeoutError",
         error_message: `Request timed out after ${timeoutMs} ms`,
       });
@@ -529,6 +594,7 @@ async function performCurl(
       method,
       target: safeTarget(currentUrl),
       elapsed_ms: elapsedMs,
+      server_auth_injected: serverAuthUsed,
       error_name: safeError.name,
       error_message: safeError.message,
     });
@@ -538,12 +604,12 @@ async function performCurl(
   }
 }
 
-function createServer(selfHost: string, mcpRay?: string): McpServer {
+function createServer(selfHost: string, env: Env, mcpRay?: string): McpServer {
   const server = new McpServer(
     { name: "internet-curl", version: VERSION },
     {
       instructions:
-        "General-purpose read/write curl for the public Internet. State-changing POST/PUT/PATCH/DELETE requests are allowed. Caller-provided Authorization, X-Api-Key, Cookie, and other application headers are forwarded. Use this tool to call authenticated APIs and web services. Only SSRF/private-network classes, self-recursion, invalid transport headers, and bounded resource limits are restricted.",
+        "General-purpose read/write curl for the public Internet. State-changing POST/PUT/PATCH/DELETE requests are allowed. Caller-provided Authorization, X-Api-Key, Cookie, and other application headers are forwarded. For https://portal-dev1az5avn.vozer.org/api/mcp, the Worker injects NocoBase Authorization server-side from NC_API_KEY, so callers should omit credentials for that endpoint. Only SSRF/private-network classes, self-recursion, invalid transport headers, and bounded resource limits are restricted.",
     },
   );
 
@@ -552,7 +618,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
     {
       title: "Internet Curl (read/write)",
       description:
-        "General-purpose HTTP/HTTPS curl for agents. Supports authenticated and state-changing API calls, including Authorization Bearer/Basic headers, X-Api-Key, cookies, POST, PUT, PATCH, DELETE, JSON, form bodies, raw bodies, and base64 binary bodies. Custom application headers are forwarded. Redirects are followed manually and caller credentials are preserved across redirects. Public Internet only; SSRF/private/internal targets and this MCP host are blocked.",
+        "General-purpose HTTP/HTTPS curl for agents. Supports authenticated and state-changing API calls, including POST, PUT, PATCH, DELETE, JSON, form bodies, raw bodies, and base64 binary bodies. Custom application headers are forwarded. For portal-dev1az5avn.vozer.org/api/mcp, do not send Authorization or API keys: the gateway injects the NocoBase Bearer token server-side. Public Internet only; SSRF/private/internal targets and this MCP host are blocked.",
       inputSchema: z.object({
         url: z.string().url().describe("Public http:// or https:// URL"),
         method: z
@@ -563,7 +629,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
           .record(z.string(), z.string())
           .optional()
           .describe(
-            "Request headers. Authorization, X-Api-Key, Cookie and custom application headers are allowed and forwarded. Only transport-controlled Host/hop-by-hop/Cloudflare spoofing headers are stripped",
+            "Request headers. Custom application headers are allowed. Authorization/X-Api-Key/Cookie are forwarded for normal targets, but credentials should be omitted for portal-dev1az5avn.vozer.org/api/mcp because server-side NocoBase auth is injected there",
           ),
         body: z.string().optional().describe("Raw UTF-8 request body"),
         body_base64: z
@@ -613,6 +679,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
         response_bytes: z.number().int(),
         elapsed_ms: z.number().int(),
         redirects: z.number().int(),
+        server_auth_injected: z.boolean(),
         truncated: z.boolean(),
       }),
       annotations: {
@@ -622,7 +689,7 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
     },
     async (args) => {
       try {
-        const result = await performCurl(args, selfHost, mcpRay);
+        const result = await performCurl(args, selfHost, env, mcpRay);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
           structuredContent: result,
@@ -668,7 +735,7 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    const handler = createMcpHandler(() => createServer(requestUrl.hostname, mcpRay));
+    const handler = createMcpHandler(() => createServer(requestUrl.hostname, env, mcpRay));
     return handler.fetch(request);
   },
 };
