@@ -20,7 +20,7 @@ export type CredentialRule = {
   updated_at: string;
 };
 
-export type CredentialRuleInput = Partial<Omit<CredentialRule, "id" | "created_at" | "updated_at">> & {
+export type CredentialRuleInput = {
   name?: unknown;
   host_pattern?: unknown;
   path_prefix?: unknown;
