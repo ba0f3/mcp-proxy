@@ -8,6 +8,11 @@
   "secrets": {
     "required": ["MCP_PATH"]
   },
+  "kv_namespaces": [
+    {
+      "binding": "CREDENTIALS"
+    }
+  ],
   "observability": {
     "enabled": true
   }
