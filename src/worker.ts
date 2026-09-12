@@ -184,10 +184,27 @@ function withSyntheticAdminPath<T extends object>(env: T, secret: string): T & {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const requestUrl = new URL(request.url);
+    const isAdminRequest =
+      requestUrl.pathname === ADMIN_PREFIX || requestUrl.pathname.startsWith(`${ADMIN_PREFIX}/`);
+
+    // Admin is a normal password-authenticated web UI. Do not run MCP's
+    // Streamable HTTP Origin gate on browser form/API requests. The admin
+    // session cookie is Secure + HttpOnly + SameSite=Strict and the UI CSP
+    // restricts forms/connects to self.
+    if (isAdminRequest) {
+      const sessionSecret = await adminSessionSecret(env.ADMIN_PASSWORD ?? "");
+      const loginResponse = await handleAdminLogin(request, env, sessionSecret);
+      if (loginResponse) return loginResponse;
+
+      // Keep the existing admin implementation/session cookie, but provide its
+      // secret internally instead of exposing it as a URL path or Worker secret.
+      return app.fetch(request, withSyntheticAdminPath(env, sessionSecret));
+    }
+
     // MCP Streamable HTTP requires Origin validation. Non-browser/server-side
     // clients normally omit Origin; if present, only same-origin is accepted.
     if (!validOrigin(request)) {
-      const requestUrl = new URL(request.url);
       console.warn(
         JSON.stringify({
           ts: new Date().toISOString(),
@@ -203,12 +220,6 @@ export default {
       return new Response("Forbidden", { status: 403 });
     }
 
-    const sessionSecret = await adminSessionSecret(env.ADMIN_PASSWORD ?? "");
-    const loginResponse = await handleAdminLogin(request, env, sessionSecret);
-    if (loginResponse) return loginResponse;
-
-    // Keep the existing admin implementation/session cookie, but provide its
-    // secret internally instead of exposing it as a URL path or Worker secret.
-    return app.fetch(request, withSyntheticAdminPath(env, sessionSecret));
+    return app.fetch(request, env);
   },
 };
