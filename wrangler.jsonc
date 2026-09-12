@@ -6,7 +6,7 @@
   "compatibility_flags": ["global_fetch_strictly_public"],
   "keep_vars": true,
   "secrets": {
-    "required": ["MCP_PATH", "ADMIN_PATH"]
+    "required": ["MCP_PATH", "ADMIN_PASSWORD"]
   },
   "kv_namespaces": [
     {
