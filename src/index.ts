@@ -5,44 +5,10 @@ interface Env {
   MCP_PATH: string;
 }
 
-const VERSION = "0.2.0";
-const DEFAULT_TIMEOUT_MS = 20_000;
-const MAX_TIMEOUT_MS = 60_000;
-const DEFAULT_MAX_BYTES = 1024 * 1024;
-const HARD_MAX_BYTES = 4 * 1024 * 1024;
-const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
-const DEFAULT_MAX_REDIRECTS = 5;
-
-const ALLOWED_METHODS = new Set([
-  "GET",
-  "HEAD",
-  "POST",
-  "PUT",
-  "PATCH",
-  "DELETE",
-  "OPTIONS",
-]);
-
-// These headers are controlled by the HTTP transport / Cloudflare and are not
-// useful as arbitrary curl inputs. Authentication headers are intentionally
-// NOT on this list: Authorization, X-Api-Key, Cookie, etc. are forwarded.
-const FORBIDDEN_REQUEST_HEADERS = new Set([
-  "host",
-  "content-length",
-  "transfer-encoding",
-  "connection",
-  "upgrade",
-  "proxy-authorization",
-  "proxy-authenticate",
-  "forwarded",
-  "via",
-  "x-forwarded-for",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "cf-connecting-ip",
-  "cf-ray",
-  "cf-visitor",
-]);
+const VERSION = "0.3.0";
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MAX_REDIRECTS = 10;
 
 const BLOCKED_HOST_SUFFIXES = [
   ".localhost",
@@ -137,8 +103,6 @@ function isIpLiteral(hostname: string): boolean {
 }
 
 function safeTarget(url: URL): string {
-  // Deliberately exclude query values and fragments from logs because API keys
-  // are sometimes passed in query strings. Keep the path for troubleshooting.
   return `${url.protocol}//${url.host}${url.pathname}`;
 }
 
@@ -171,12 +135,6 @@ function validateTargetUrl(rawUrl: string, selfHost: string): URL {
     throw new Error("Only http:// and https:// URLs are allowed");
   }
 
-  if (url.username || url.password) {
-    throw new Error(
-      "Credentials embedded in URLs are not supported; use Authorization or another request header",
-    );
-  }
-
   const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
   const ownHost = selfHost.toLowerCase().replace(/\.$/, "");
 
@@ -187,9 +145,6 @@ function validateTargetUrl(rawUrl: string, selfHost: string): URL {
     throw new Error("Local/internal hostnames are blocked");
   }
 
-  // Workers global fetch does not support direct IP-address URLs. Reject them
-  // explicitly so failures are deterministic and cannot be used to probe
-  // link-local/private address space.
   if (isIpLiteral(hostname)) {
     throw new Error("IP-literal targets are blocked; use a public DNS hostname");
   }
@@ -197,23 +152,17 @@ function validateTargetUrl(rawUrl: string, selfHost: string): URL {
   return url;
 }
 
-function sanitizeHeaders(input?: Record<string, string>): Headers {
-  const headers = new Headers();
-  if (!input) return headers;
-
-  for (const [rawName, rawValue] of Object.entries(input)) {
-    const name = rawName.trim().toLowerCase();
-    if (!name || FORBIDDEN_REQUEST_HEADERS.has(name) || name.startsWith("cf-")) {
-      continue;
-    }
-    headers.set(name, String(rawValue));
-  }
-
-  return headers;
+function buildHeaders(input?: Record<string, string>): Headers {
+  // Transparent pass-through: do not classify, remove, rewrite, or override
+  // caller headers. The Workers Fetch runtime remains the final authority on
+  // whether a particular HTTP header is accepted on an outbound request.
+  return new Headers(input ?? {});
 }
 
-function authSummary(headers: Headers): Record<string, boolean> {
+function headerSummary(headers: Headers): Record<string, unknown> {
+  const names = Array.from(headers.keys()).sort();
   return {
+    header_names: names,
     authorization: headers.has("authorization"),
     x_api_key: headers.has("x-api-key"),
     cookie: headers.has("cookie"),
@@ -244,44 +193,22 @@ function bytesToBase64(bytes: Uint8Array): string {
 
 function base64ToArrayBuffer(input: string): ArrayBuffer {
   const compact = input.replace(/\s+/g, "");
-  if (compact.length > Math.ceil((MAX_REQUEST_BODY_BYTES * 4) / 3) + 8) {
-    throw new Error(`Decoded request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`);
-  }
-
-  let binary: string;
-  try {
-    binary = atob(compact);
-  } catch {
-    throw new Error("body_base64 is not valid base64");
-  }
-
-  if (binary.length > MAX_REQUEST_BODY_BYTES) {
-    throw new Error(`Decoded request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`);
-  }
-
+  const binary = atob(compact);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes.buffer;
 }
 
 function prepareBody(args: CurlArgs, headers: Headers): PreparedBody {
-  const supplied = [
-    args.body !== undefined,
-    args.body_base64 !== undefined,
-    args.json !== undefined,
-    args.form !== undefined,
-  ].filter(Boolean).length;
-
-  if (supplied > 1) {
-    throw new Error("Use only one of body, body_base64, json, or form");
-  }
-
+  // `body` is the exact/pass-through path. The other fields are convenience
+  // encodings for agents. If more than one is supplied, use deterministic
+  // precedence instead of rejecting the request: body > body_base64 > json > form.
   if (args.body !== undefined) {
-    const bytes = new TextEncoder().encode(args.body).byteLength;
-    if (bytes > MAX_REQUEST_BODY_BYTES) {
-      throw new Error(`Request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`);
-    }
-    return { body: args.body, bytes, kind: "raw" };
+    return {
+      body: args.body,
+      bytes: new TextEncoder().encode(args.body).byteLength,
+      kind: "raw",
+    };
   }
 
   if (args.body_base64 !== undefined) {
@@ -290,30 +217,25 @@ function prepareBody(args: CurlArgs, headers: Headers): PreparedBody {
   }
 
   if (args.json !== undefined) {
-    let body: string;
-    try {
-      body = JSON.stringify(args.json);
-    } catch {
-      throw new Error("json body is not serializable");
-    }
-    const bytes = new TextEncoder().encode(body).byteLength;
-    if (bytes > MAX_REQUEST_BODY_BYTES) {
-      throw new Error(`Request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`);
-    }
+    const body = JSON.stringify(args.json);
     if (!headers.has("content-type")) headers.set("content-type", "application/json");
-    return { body, bytes, kind: "json" };
+    return {
+      body,
+      bytes: new TextEncoder().encode(body).byteLength,
+      kind: "json",
+    };
   }
 
   if (args.form !== undefined) {
     const body = new URLSearchParams(args.form).toString();
-    const bytes = new TextEncoder().encode(body).byteLength;
-    if (bytes > MAX_REQUEST_BODY_BYTES) {
-      throw new Error(`Request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`);
-    }
     if (!headers.has("content-type")) {
       headers.set("content-type", "application/x-www-form-urlencoded");
     }
-    return { body, bytes, kind: "form" };
+    return {
+      body,
+      bytes: new TextEncoder().encode(body).byteLength,
+      kind: "form",
+    };
   }
 
   return { body: undefined, bytes: 0, kind: "none" };
@@ -374,10 +296,12 @@ function redirectRequest(
   body: string | ArrayBuffer | undefined,
   headers: Headers,
 ): { method: string; body: string | ArrayBuffer | undefined; headers: Headers } {
-  if (status === 303 || ((status === 301 || status === 302) && method === "POST")) {
-    const nextHeaders = new Headers(headers);
-    nextHeaders.delete("content-type");
-    return { method: "GET", body: undefined, headers: nextHeaders };
+  // Preserve curl/browser redirect semantics while keeping the caller headers
+  // otherwise untouched. Redirects are manual only so every target can pass
+  // the network/SSRF validation before the next outbound request.
+  const upperMethod = method.toUpperCase();
+  if (status === 303 || ((status === 301 || status === 302) && upperMethod === "POST")) {
+    return { method: "GET", body: undefined, headers };
   }
   return { method, body, headers };
 }
@@ -390,24 +314,22 @@ async function performCurl(
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   let currentUrl = validateTargetUrl(args.url, selfHost);
-  let method = (args.method ?? "GET").toUpperCase();
-  let headers = sanitizeHeaders(args.headers);
+  let method = args.method ?? "GET";
+  let headers = buildHeaders(args.headers);
   const prepared = prepareBody(args, headers);
   let body = prepared.body;
 
-  if (!ALLOWED_METHODS.has(method)) {
-    throw new Error(`Method ${method} is not allowed`);
-  }
-  if ((method === "GET" || method === "HEAD") && body !== undefined) {
-    throw new Error(`${method} requests cannot include a body`);
+  const timeoutMs = args.timeout_ms ?? DEFAULT_TIMEOUT_MS;
+  const maxBytes = args.max_bytes ?? DEFAULT_MAX_BYTES;
+  const followRedirects = args.follow_redirects ?? true;
+  const maxRedirects = args.max_redirects ?? DEFAULT_MAX_REDIRECTS;
+
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => controller.abort("request timeout"), timeoutMs);
   }
 
-  const timeoutMs = Math.min(args.timeout_ms ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
-  const maxBytes = Math.min(args.max_bytes ?? DEFAULT_MAX_BYTES, HARD_MAX_BYTES);
-  const followRedirects = args.follow_redirects ?? true;
-  const maxRedirects = Math.min(args.max_redirects ?? DEFAULT_MAX_REDIRECTS, 10);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("request timeout"), timeoutMs);
   let redirectCount = 0;
 
   logEvent("info", "curl.start", {
@@ -421,7 +343,7 @@ async function performCurl(
     timeout_ms: timeoutMs,
     max_response_bytes: maxBytes,
     follow_redirects: followRedirects,
-    ...authSummary(headers),
+    ...headerSummary(headers),
   });
 
   try {
@@ -447,10 +369,6 @@ async function performCurl(
         const crossOrigin = nextUrl.origin !== currentUrl.origin;
         redirectCount += 1;
 
-        // This gateway intentionally behaves like an explicit, trusted curl
-        // agent: caller-supplied Authorization/X-Api-Key/Cookie headers survive
-        // manual redirects, including cross-origin redirects. Log the fact, but
-        // never log credential values.
         logEvent(crossOrigin ? "warn" : "info", "curl.redirect", {
           request_id: requestId,
           mcp_ray: mcpRay,
@@ -459,7 +377,8 @@ async function performCurl(
           from: safeTarget(currentUrl),
           to: safeTarget(nextUrl),
           cross_origin: crossOrigin,
-          credentials_forwarded: crossOrigin && Object.values(authSummary(headers)).some(Boolean),
+          headers_forwarded_unchanged: true,
+          ...headerSummary(headers),
         });
 
         const next = redirectRequest(response.status, method, body, headers);
@@ -471,9 +390,13 @@ async function performCurl(
         continue;
       }
 
-      const { bytes, truncated } = await readLimitedBody(response, maxBytes);
+      const boundedMaxBytes = Number.isFinite(maxBytes) && maxBytes > 0
+        ? Math.floor(maxBytes)
+        : DEFAULT_MAX_BYTES;
+      const { bytes, truncated } = await readLimitedBody(response, boundedMaxBytes);
       const textual = isTextual(response.headers.get("content-type"));
       const elapsedMs = Date.now() - startedAt;
+
       const result: CurlResult = {
         request_id: requestId,
         status: response.status,
@@ -509,6 +432,7 @@ async function performCurl(
     }
   } catch (error) {
     const elapsedMs = Date.now() - startedAt;
+
     if (controller.signal.aborted) {
       logEvent("error", "curl.error", {
         request_id: requestId,
@@ -534,7 +458,7 @@ async function performCurl(
     });
     throw error;
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -543,63 +467,64 @@ function createServer(selfHost: string, mcpRay?: string): McpServer {
     { name: "internet-curl", version: VERSION },
     {
       instructions:
-        "General-purpose read/write curl for the public Internet. State-changing POST/PUT/PATCH/DELETE requests are allowed. Caller-provided Authorization, X-Api-Key, Cookie, and other application headers are forwarded. Use this tool to call authenticated APIs and web services. Only SSRF/private-network classes, self-recursion, invalid transport headers, and bounded resource limits are restricted.",
+        "Transparent HTTP/HTTPS curl for the public Internet. Forward caller method, headers, credentials, cookies, and body without application-level filtering or auth/write policy. Only the public-network/SSRF boundary and Cloudflare runtime limitations apply.",
     },
   );
 
   server.registerTool(
     "curl",
     {
-      title: "Internet Curl (read/write)",
+      title: "Internet Curl",
       description:
-        "General-purpose HTTP/HTTPS curl for agents. Supports authenticated and state-changing API calls, including Authorization Bearer/Basic headers, X-Api-Key, cookies, POST, PUT, PATCH, DELETE, JSON, form bodies, raw bodies, and base64 binary bodies. Custom application headers are forwarded. Redirects are followed manually and caller credentials are preserved across redirects. Public Internet only; SSRF/private/internal targets and this MCP host are blocked.",
+        "Transparent HTTP/HTTPS request tool. Caller-supplied method, headers, Authorization, X-Api-Key, Cookie, custom credentials, query string, and body are forwarded as supplied. POST/PUT/PATCH/DELETE and arbitrary HTTP methods are not blocked by this MCP server. The server only validates the destination against the public-network/SSRF boundary and manually validates redirect targets.",
       inputSchema: z.object({
-        url: z.string().url().describe("Public http:// or https:// URL"),
+        url: z.string().url().describe("Public http:// or https:// URL, including any query string"),
         method: z
-          .enum(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+          .string()
           .optional()
-          .describe("HTTP method; defaults to GET. Write methods are allowed"),
+          .describe("HTTP method forwarded to fetch as supplied; defaults to GET"),
         headers: z
           .record(z.string(), z.string())
           .optional()
-          .describe(
-            "Request headers. Authorization, X-Api-Key, Cookie and custom application headers are allowed and forwarded. Only transport-controlled Host/hop-by-hop/Cloudflare spoofing headers are stripped",
-          ),
-        body: z.string().optional().describe("Raw UTF-8 request body"),
+          .describe("HTTP request headers forwarded without MCP-side filtering, rewriting, or credential stripping"),
+        body: z
+          .string()
+          .optional()
+          .describe("Raw UTF-8 request body forwarded exactly as supplied; takes precedence over convenience body fields"),
         body_base64: z
           .string()
           .optional()
-          .describe("Base64-encoded binary request body. Mutually exclusive with body/json/form"),
+          .describe("Convenience: base64-encoded binary request body, used when body is absent"),
         json: z
           .unknown()
           .optional()
-          .describe("JSON value to serialize as the request body; automatically sets application/json unless Content-Type is provided"),
+          .describe("Convenience: JSON request body, used when body/body_base64 are absent"),
         form: z
           .record(z.string(), z.string())
           .optional()
-          .describe("URL-encoded form fields; automatically sets application/x-www-form-urlencoded unless Content-Type is provided"),
+          .describe("Convenience: URL-encoded form body, used when body/body_base64/json are absent"),
         timeout_ms: z
           .number()
           .int()
-          .min(500)
-          .max(MAX_TIMEOUT_MS)
+          .nonnegative()
           .optional()
-          .describe("Overall request timeout in milliseconds; default 20000, max 60000"),
+          .describe("Overall timeout in milliseconds. 0 disables the MCP-side timeout; default 30000"),
         max_bytes: z
           .number()
           .int()
-          .min(1)
-          .max(HARD_MAX_BYTES)
+          .positive()
           .optional()
-          .describe("Maximum response body bytes returned; default 1 MiB, max 4 MiB"),
-        follow_redirects: z.boolean().optional().describe("Follow redirects; default true"),
+          .describe("Maximum response bytes returned to the agent; default 2 MiB"),
+        follow_redirects: z
+          .boolean()
+          .optional()
+          .describe("Follow redirects after revalidating every target; default true"),
         max_redirects: z
           .number()
           .int()
-          .min(0)
-          .max(10)
+          .nonnegative()
           .optional()
-          .describe("Maximum redirects when following; default 5"),
+          .describe("Maximum manually followed redirects; default 10"),
       }),
       outputSchema: z.object({
         request_id: z.string(),
@@ -644,6 +569,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const mcpRay = request.headers.get("cf-ray") ?? undefined;
     let expectedPath: string;
+
     try {
       expectedPath = normalizeSecretPath(env.MCP_PATH ?? "");
     } catch (error) {
@@ -657,8 +583,6 @@ export default {
 
     const requestUrl = new URL(request.url);
 
-    // The path itself is the bearer secret. Never log requestUrl.pathname here.
-    // Return 404 rather than 401 so MCP clients do not start OAuth discovery.
     if (requestUrl.pathname !== expectedPath) {
       logEvent("warn", "mcp.auth_rejected", {
         mcp_ray: mcpRay,
