@@ -2,6 +2,7 @@ import app from "./index";
 
 interface Env {
   MCP_PATH: string;
+  ADMIN_PATH: string;
 }
 
 function validOrigin(request: Request): boolean {
