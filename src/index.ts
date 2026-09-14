@@ -1,6 +1,7 @@
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import { handleAdminRequest } from "./admin";
+import { registerScreenshotTool } from "./browser-run";
 import {
   applyCredentialRules,
   loadCredentialRules,
@@ -11,6 +12,8 @@ interface Env {
   MCP_PATH: string;
   ADMIN_PATH?: string;
   CREDENTIALS?: CredentialKV;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CLOUDFLARE_API_TOKEN?: string;
 }
 
 const VERSION = "0.4.0";
@@ -496,7 +499,7 @@ function createServer(selfHost: string, env: Env, mcpRay?: string): McpServer {
     { name: "internet-curl", version: VERSION },
     {
       instructions:
-        "Transparent HTTP/HTTPS curl for the public Internet. Forward caller method, headers, credentials, cookies, and body without application-level filtering or auth/write policy. Server-managed credential rules may add or override request headers based on destination domain/path. Only the public-network/SSRF boundary and Cloudflare runtime limitations apply.",
+        "Transparent HTTP/HTTPS curl and rendered screenshot access for the public Internet. Curl forwards caller method, headers, credentials, cookies, and body without application-level filtering or auth/write policy. Server-managed credential rules may add or override curl request headers based on destination domain/path. The screenshot tool uses Cloudflare Browser Run with server-side Cloudflare credentials. Only the public-network/SSRF boundary and Cloudflare runtime limitations apply.",
     },
   );
 
@@ -591,6 +594,15 @@ function createServer(selfHost: string, env: Env, mcpRay?: string): McpServer {
       }
     },
   );
+
+  registerScreenshotTool(server, {
+    selfHost,
+    env,
+    mcpRay,
+    validateTargetUrl,
+    safeTarget,
+    logEvent,
+  });
 
   return server;
 }
