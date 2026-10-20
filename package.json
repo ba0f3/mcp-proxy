@@ -10,7 +10,7 @@
     "check": "tsc --noEmit && wrangler deploy --dry-run --outdir .wrangler/dry-run"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.0",
     "zod": "^4.1.5"
   },
   "devDependencies": {
